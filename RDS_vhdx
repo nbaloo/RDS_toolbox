@@ -1,0 +1,345 @@
+ <#
+==============================================================================
+Recherche VHDx FSLogix / RDS (READ ONLY)
+Nicolas GRUBER - 03.07.2026 - HFR - avec l'aide de ChatGPT
+  
+Objectif :
+Identifier le serveur RDS hébergeant actuellement le conteneur FSLogix
+d'un utilisateur.
+  
+Méthode :
+- récupération de la liste des serveurs à analyser via le serveur Manager
+- tri des serveurs pour se concentrer sur les serveurs RDS
+- Lecture des événements FSLogix / RDS.
+- Détection des serveurs candidats (session active, déconnectée ou en erreur).
+- Confirmation par présence du volume "Profile-<Utilisateur>".
+  
+Le script strictement en READ ONLY :
+Aucune modification, aucune fermeture de session, aucun démontage de VHD.
+  
+==============================================================================
+#>
+  
+# ============================================================
+# PARAMETRES
+# ============================================================
+  
+$T0      = Get-Date
+$User    = "admt1-grubern"
+$Minutes = 3600
+$Start   = (Get-Date).AddMinutes(-$Minutes)
+  
+# ============================================================
+# LECTURE DES SERVEURS DEPUIS SERVER MANAGER
+# ============================================================
+  
+[xml]$Xml = Get-Content "$env:APPDATA\Microsoft\Windows\ServerManager\ServerList.xml"
+  
+$Servers = $Xml.ServerList.ServerInfo.Name |
+    Sort-Object -Unique |
+    Where-Object { $_ -match "RDS" -and $_ -notmatch "BROK|APPEXT|APP|TMPL|MGMT" }
+  
+# ============================================================
+# ETAPE 1 - TEST WINRM
+# ============================================================
+  
+$Online  = @()
+$Offline = @()
+  
+$total = $Servers.Count
+$i = 0
+  
+foreach ($srv in $Servers) {
+    $i++
+    Write-Host ("[{0,3}/{1}] Test WinRM {2}" -f $i,$total,$srv) -ForegroundColor Gray
+  
+    if (Test-WSMan $srv -ErrorAction SilentlyContinue) {
+        $Online += $srv
+    }
+    else {
+        $Offline += $srv
+    }
+}
+  
+Write-Host "Total : $total | Online : $($Online.Count) | Offline : $($Offline.Count) "
+  
+# ============================================================
+# ETAPE 2 - COLLECTE EVENTS PAR INVOKE-COMMAND
+# ============================================================
+  
+$Events = @()
+$BadInvoke = @()
+  
+$Logs = @(
+    "Microsoft-FSLogix-Apps/Operational",
+    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+)
+  
+$total = $Online.Count
+$i = 0
+  
+foreach ($srv in $Online) {
+    $i++
+    Write-Host ("[{0,3}/{1}] Controle sur {2}" -f $i,$total,$srv) -ForegroundColor Gray
+  
+    try {
+        $Events += Invoke-Command -ComputerName $srv -ErrorAction Stop -ScriptBlock {
+            param($User,$Start,$Logs)
+  
+            foreach ($Log in $Logs) {
+  
+                try {
+                    # Filtre different selon le journal
+                    $Filter = @{
+                        LogName   = $Log
+                        StartTime = $Start
+                    }
+  
+                    if ($Log -eq "Microsoft-FSLogix-Apps/Operational") {
+                        $Filter.Id = @(25)
+                    }
+                    elseif ($Log -eq "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational") {
+                        $Filter.Id = @(21,22,23,24,41,42)
+                    }
+                    elseif ($Log -eq "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational") {
+                        $Filter.Id = @(1149)
+                    }
+  
+                    $RawEvents = Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop
+                }
+                catch {
+                    continue
+                }
+  
+                $RawEvents |
+                Where-Object { $_.Message -match [regex]::Escape($User) } |
+                ForEach-Object {
+                    $Msg = ($_.Message -replace "`r|`n"," " -replace "\s+"," ").Trim()
+  
+                    $Action = switch -Regex ($Msg) {
+                        "User authentication succeeded" { "AUTH"; break }
+                        "Session logon succeeded"       { "LOGON"; break }
+                        "Shell start"                   { "SHELL"; break }
+                        "Session logoff succeeded"      { "LOGOFF"; break }
+                        "Session has been disconnected" { "DISCO"; break }
+                        "Profile load.*Status:\s*0"     { "FSLOAD"; break }
+                        "Profile load"                  { "FSLOAD_ERR"; break }
+                        "error|failed|denied|lock"      { "ERROR"; break }
+                        default                         { "INFO" }
+                    }
+  
+                    [PSCustomObject]@{
+                        Time      = $_.TimeCreated
+                        Server    = $env:COMPUTERNAME
+                        Action    = $Action
+                        Id        = $_.Id
+                        SessionId = if ($Msg -match "Session ID:\s*(\d+)") { $matches[1] } else { "" }
+                    }
+                }
+            }
+        } -ArgumentList $User,$Start,$Logs
+    }
+    catch {
+        $BadInvoke += $srvf
+    }
+}
+  
+$Events = $Events | Sort-Object Time
+  
+# ============================================================
+# ETAPE 3 - ANALYSE DES Candidats
+# ============================================================
+  
+$Suspects = @($Analysis | Where-Object { $_.IsSuspect })
+  
+$Analysis = @($Events | Group-Object Server | ForEach-Object {
+    $g = $_.Group | Sort-Object Time
+    $last = $g | Select-Object -Last 1
+  
+    $hasLogon  = $g.Action -contains "LOGON"
+    $hasShell  = $g.Action -contains "SHELL"
+    $hasFsload = $g.Action -contains "FSLOAD"
+    $hasLogoff = $g.Action -contains "LOGOFF"
+    $hasDisco  = $g.Action -contains "DISCO"
+    $hasError  = ($g.Action -contains "ERROR") -or ($g.Action -contains "FSLOAD_ERR")
+  
+    $IsSuspect = $false
+    $Reason = ""
+  
+    if ($hasError) {
+        $IsSuspect = $true
+        $Reason = "ERREUR/LOCK possible"
+    }
+    elseif ($hasFsload -and -not $hasLogoff) {
+        $IsSuspect = $true
+        $Reason = "profil FSLogix charge sans logoff detecte"
+    }
+    elseif ($hasLogon -and -not $hasLogoff) {
+        $IsSuspect = $true
+        $Reason = "session utilisateur ouverte sans logoff detecte"
+    }
+    elseif ($hasDisco -and -not $hasLogoff) {
+        $IsSuspect = $true
+        $Reason = "session deconnectee sans logoff"
+    }
+  
+    [PSCustomObject]@{
+        Server     = $_.Name
+        Last       = $last.Time
+        LastAction = $last.Action
+        SessionId  = $last.SessionId
+        IsSuspect  = $IsSuspect
+        Reason     = $Reason
+    }
+})
+  
+$Suspects = @($Analysis | Where-Object { $_.IsSuspect })
+# ============================================================
+# ETAPE 4 - CONTROLE VOLUME FSLOGIX
+# ============================================================
+  
+$VolumeCheck = @()
+  
+foreach ($srv in $Suspects.Server) {
+    Write-Host ("Controle volume FSLogix sur {0}" -f $srv) -ForegroundColor Cyan
+  
+    try {
+        $VolumeCheck += Invoke-Command -ComputerName $srv -ErrorAction Stop -ScriptBlock {
+            param($User)
+  
+            Get-Volume -ErrorAction SilentlyContinue |
+            Where-Object { $_.FileSystemLabel -eq "Profile-$User" } |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    Server = $env:COMPUTERNAME
+                    Label  = $_.FileSystemLabel
+                    FreeGB = [math]::Round($_.SizeRemaining / 1GB, 2)
+                    SizeGB = [math]::Round($_.Size / 1GB, 2)
+                }
+            }
+        } -ArgumentList $User
+    }
+    catch {
+        $BadInvoke += $srv
+    }
+}
+  
+# ============================================================
+# BLOC 5 RAPPORT FINAL
+# ============================================================
+  
+$Runtime = (Get-Date) - $T0
+  
+cls
+  
+Write-Host "        HFR - Diagnostic FSLogix / RDS (READ ONLY)" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+Write-Host ("Utilisateur       : {0}" -f $User)
+Write-Host ("Fenetre analyse   : {0} minutes" -f $Minutes)
+Write-Host ("Serveurs analyses : {0}" -f $Online.Count)
+Write-Host ("Duree du scan     : {0}" -f $Runtime.ToString("hh\:mm\:ss"))
+Write-Host ("Date              : {0}" -f (Get-Date).ToString("dd.MM.yyyy HH:mm:ss"))
+Write-Host ""
+  
+Write-Host "ETAPE 1 - CONNECTIVITE WINRM" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+Write-Host ("Serveurs testes        : {0}" -f $Servers.Count)
+Write-Host ("Joignables             : {0}" -f $Online.Count)
+Write-Host ("Non joignables         : {0}" -f $Offline.Count)
+Write-Host ""
+  
+if ($Offline.Count) {
+    Write-Host "Serveurs non joignables :" -ForegroundColor Yellow
+    $Offline | ForEach-Object { Write-Host (" - {0}" -f $_) -ForegroundColor Yellow }
+}
+else {
+    Write-Host "Tous les serveurs repondent a WinRM." -ForegroundColor Green
+}
+  
+Write-Host ""
+Write-Host "ETAPE 2 - INVOKE-COMMAND" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+Write-Host ("Serveurs en erreur : {0}" -f (($BadInvoke | Sort-Object -Unique).Count))
+Write-Host ""
+  
+if ($BadInvoke.Count) {
+    ($BadInvoke | Sort-Object -Unique) | ForEach-Object {
+        Write-Host (" - {0}" -f $_) -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host "Aucun serveur n'a refuse l'execution distante." -ForegroundColor Green
+}
+  
+Write-Host ""
+Write-Host "ETAPE 3 - TIMELINE DES EVENEMENTS" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+  
+if ($Events.Count) {
+    foreach ($e in $Events) {
+        $Color = switch ($e.Action) {
+            "LOGOFF"     { "Green" }
+            "FSLOAD"     { "Green" }
+            "LOGON"      { "Green" }
+            "SHELL"      { "DarkGreen" }
+            "DISCO"      { "Yellow" }
+            "ERROR"      { "Red" }
+            "FSLOAD_ERR" { "Red" }
+            default      { "Gray" }
+        }
+  
+        Write-Host ("{0:HH:mm:ss}  {1,-14} {2,-8} SID:{3,-3} ID:{4}" -f $e.Time,$e.Server,$e.Action,$e.SessionId,$e.Id) -ForegroundColor $Color
+    }
+}
+else {
+    Write-Host "Aucun evenement trouve pour cet utilisateur dans la fenetre analysee." -ForegroundColor Yellow
+}
+  
+Write-Host ""
+Write-Host "ETAPE 4 - ANALYSE" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+  
+Write-Host ("Nombre de serveurs candidats au controle volume : {0}" -f $Suspects.Count)
+Write-Host ""
+  
+if ($Suspects.Count -gt 0) {
+    foreach ($s in ($Suspects | Sort-Object Last -Descending)) {
+        Write-Host $s.Server -ForegroundColor Yellow
+        Write-Host ("  Derniere action : {0}" -f $s.LastAction)
+        Write-Host ("  Session         : {0}" -f $s.SessionId)
+        Write-Host ("  Analyse         : {0}" -f $s.Reason)
+        Write-Host ""
+    }
+}
+else {
+    Write-Host "Aucun serveur candidat detecte pour le controle volume." -ForegroundColor Green
+}
+  
+Write-Host "ETAPE 5 - CONTROLE FSLOGIX" -ForegroundColor Cyan
+Write-Host "==============================================================" -ForegroundColor Cyan
+  
+if ($VolumeCheck.Count -gt 0) {
+    foreach ($v in $VolumeCheck) {
+        Write-Host $v.Server -ForegroundColor Magenta
+        Write-Host ("  Volume detecte : {0}" -f $v.Label)
+        Write-Host ("  Taille         : {0} GB" -f $v.SizeGB)sss
+        Write-Host ("  disponible     : {0} GB" -f $v.FreeGB)
+        Write-Host ""
+    }
+  
+    Write-Host "==============================================================" -ForegroundColor Magenta
+    Write-Host "RESULTAT : " -ForegroundColor Magenta -NoNewline
+    Write-Host ("Volume : {0}" -f $VolumeCheck[0].Label) -ForegroundColor Green -NoNewline
+    Write-Host ("sur : $v.Server" -ForegroundColor Green
+    Write-Host "==============================================================" -ForegroundColor Magenta
+  
+   
+}
+elseif ($Suspects.Count -gt 0) {
+    Write-Host "Aucun volume Profile-$User trouve sur les serveurs candidats." -ForegroundColor Yellow
+}
+else {
+    Write-Host "Controle ignore : aucun serveur candidat." -ForegroundColor Green
+} 
+
