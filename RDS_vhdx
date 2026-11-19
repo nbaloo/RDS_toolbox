@@ -1,345 +1,918 @@
- <#
-==============================================================================
-Recherche VHDx FSLogix / RDS (READ ONLY)
-Nicolas GRUBER - 03.07.2026 - HFR - avec l'aide de ChatGPT
+ #Requires -Version 5.1
   
-Objectif :
-Identifier le serveur RDS hébergeant actuellement le conteneur FSLogix
-d'un utilisateur.
+# =====================================================================
+# AUDIT RDS - SESSIONS UTILISATEURS ET MEMOIRE DES SERVEURS
+# =====================================================================
+#
+# OBJECTIF
+#   Donner une vue globale de l'occupation des serveurs RDS, des sessions
+#   utilisateurs et de la pression memoire sur le perimetre choisi.
+#
+# PARAMETRES - BLOC 1
+#   - Filtre regex sur les hostnames issus de ServerList.xml.
+#   - Nombre de collectes paralleles et timeout global.
+#   - Nombre de sessions affichees dans les classements.
+#   - Collecte de toutes les sessions ou uniquement des deconnectees.
+#   - Seuils d'alerte IDLE, deconnexion et memoire validee.
+#   - Affichage Out-GridView optionnel.
+#
+# FONCTIONNEMENT
+#   - Lecture du ServerList.xml du compte executant le script.
+#   - Selection des serveurs selon le filtre, sans le domaine DNS.
+#   - Collecte distante en parallele via PowerShell Remoting.
+#   - Lecture seule des serveurs : aucune fermeture de session,
+#     modification du SWAP, du mode DRAIN ou de la configuration.
+#
+# SYNTHESE PAR SERVEUR
+#   - Nombre de sessions et de sessions deconnectees.
+#   - Mode DRAIN et nombre de jours depuis le dernier demarrage.
+#   - RAM utilisee / totale visible par Windows dans la VM.
+#   - SWAP utilise / taille actuelle des fichiers d'echange Windows.
+#   - Configuration du SWAP : automatique, systeme, fixe ou variable.
+#   - Memoire validee / limite et marge de validation restante.
+#   - Tri par marge de validation croissante.
+#
+# DETAIL DES SESSIONS
+#   - Serveur, utilisateur, identifiant et etat de session.
+#   - Dates d'ouverture, connexion et deconnexion.
+#   - Duree d'inactivite et duree de deconnexion.
+#   - RAM des processus, memoire privee engagee et nombre de processus.
+#   - Classements par memoire privee engagee, inactivite et anciennete de deconnexion.
+#
+# RESUME UTILISATEURS
+#   - Nombre total de sessions collectees.
+#   - Sessions deconnectees.
+#   - Sessions actives avec une duree d'inactivite superieure a zero.
+#   - Sessions a la fois deconnectees et avec inactivite.
+#   - Memoire privee engagee moyenne et mediane par session.
+#
+# RESUME SERVEURS
+#   - Nombre de serveurs retenus par le filtre et nombre analyses.
+#   - Nombre de serveurs en maintenance selon le mode DRAIN.
+#   - Mediane du nombre de sessions par serveur.
+#   - Nombre de serveurs au niveau du P20 ou en dessous,
+#     avec affichage de la valeur du P20.
+#   - Statistiques calculees sur tous les serveurs analyses,
+#     y compris ceux sans session et ceux en DRAIN.
+#
+# ALERTES
+#   - Timeout global atteint, uniquement si survenu.
+#   - Noms des serveurs en echec ou sans resultat.
+#   - Sessions actives IDLE au-dela du seuil en minutes.
+#   - Sessions deconnectees au-dela du seuil en heures.
+#   - Serveurs avec memoire validee >= au seuil defini (90 %).
+#   - Sessions dont la memoire privee engagee depasse strictement le P90,
+#     avec affichage de la valeur du P90.
+#   - Serveurs avec RAM utilisee >= 80 %.
+#
+# INTERPRETATION
+#   - IDLE mesure le temps depuis la derniere entree utilisateur.
+#     Une session Active peut etre inactive : pause, lecture,
+#     autre travail, etc. IDLE ne signifie pas session abandonnee.
+#
+#   - RAM par session : somme des working sets de ses processus.
+#     Des pages partagees peuvent etre comptees plusieurs fois.
+#     Ce total n'est pas la RAM exactement recuperable a la fermeture.
+#
+#   - Memoire privee engagee : engagement prive des processus,
+#     pouvant etre en RAM ou pagine. Ce n'est pas le SWAP utilise.
+#
+#   - SWAP utilise : occupation actuelle des fichiers d'echange.
+#     Memoire validee ne signifie pas RAM utilisee + SWAP utilise.
+#
+#   - Memoire validee : engagement memoire du systeme.
+#     La marge mesure la capacite d'engagement restante selon
+#     la limite actuelle, qui peut evoluer si le SWAP grandit.
+#
+#   - SWAP automatique : Windows gere la taille. La configuration
+#     ne garantit pas qu'un agrandissement sera immediat ou possible.
+#     Une modification de configuration peut attendre un redemarrage.
+#
+#   - Mediane : valeur centrale de la population mesuree.
+#     P20 sessions : 20 % des serveurs ont un nombre de sessions
+#     inferieur ou egal a cette valeur, selon le rang retenu.
+#     P90 memoire privee engagee : 90 % des sessions ont une consommation inferieure
+#     ou egale a cette valeur, selon le rang retenu.
+#     Les egalites peuvent modifier les effectifs correspondants.
+#     Les percentiles decrivent la repartition, pas une anomalie.
+#
+# SORTIES
+#   - Tableaux console et Out-GridView optionnel pour les sessions.
+#   - Resume utilisateurs, serveurs et alertes.
+#   - Exports CSV horodates dans le sous-dossier "log" du script.
+#
+# PREREQUIS ET LIMITES
+#   - Windows PowerShell 5.1.
+#   - PowerShell Remoting et droits de lecture adaptes.
+#   - ServerList.xml present dans le profil du compte executant.
+#   - Execution du fichier .ps1 pour disposer de $PSScriptRoot.
+#   - Releves effectues a des instants proches, mais non simultanes.
+#   - Les serveurs sans resultat sont exclus des statistiques.
+#   - Avec OnlyDisconnected active, les statistiques de sessions
+#     portent uniquement sur les sessions deconnectees collectees.
+#   - Les CSV contiennent des noms de serveurs et d'utilisateurs :
+#     limiter leur diffusion au perimetre autorise.
+#
+# =====================================================================
+# VERSION 1.1 - release 13.11.2026
+<# début des update de versionning update
+13.11.2026 - Statistiques et TOP harmonises sur Private_Go.
+RAM_Go conserve dans les details et mesures physiques serveur conservees.
   
-Méthode :
-- récupération de la liste des serveurs à analyser via le serveur Manager
-- tri des serveurs pour se concentrer sur les serveurs RDS
-- Lecture des événements FSLogix / RDS.
-- Détection des serveurs candidats (session active, déconnectée ou en erreur).
-- Confirmation par présence du volume "Profile-<Utilisateur>".
-  
-Le script strictement en READ ONLY :
-Aucune modification, aucune fermeture de session, aucun démontage de VHD.
-  
-==============================================================================
 #>
   
-# ============================================================
-# PARAMETRES
-# ============================================================
+# =====================================================================
+# BLOC 1 - PARAMETRES
+# =====================================================================
   
-$T0      = Get-Date
-$User    = "admt1-grubern"
-$Minutes = 3600
-$Start   = (Get-Date).AddMinutes(-$Minutes)
+$limiteuser = 10         #combien on affiche de user dans les petits rapport de fin
+$ThrottleLimit = 12         # combien de serveur sont testés en même temps
+$TimeoutSeconds = 180         # Delai global avant arret des collectes restantes
+$OnlyDisconnected = $false      #voir que les session disconnected
   
-# ============================================================
-# LECTURE DES SERVEURS DEPUIS SERVER MANAGER
-# ============================================================
+$ExportPath = Join-Path $PSScriptRoot "log"    #export path
+$afficherOUTGRID = $false                     #afficher un rapport final OUTGRID
   
-[xml]$Xml = Get-Content "$env:APPDATA\Microsoft\Windows\ServerManager\ServerList.xml"
+# définir les seuils d'alerte de fin de script
+$SeuilIdleMinutes       = 120       #en minutes
+$SeuilDeconnexionHeures = 3         # en heure
+$SeuilValidationPct = 90
   
-$Servers = $Xml.ServerList.ServerInfo.Name |
-    Sort-Object -Unique |
-    Where-Object { $_ -match "RDS" -and $_ -notmatch "BROK|APPEXT|APP|TMPL|MGMT" }
+$ServeurFiltre = '^SPHFRRDS\d+$'                                      # SPHFRRDS suivi uniquement de chiffres
+        # Filtre REGEX applique au hostname uniquement (sans le domaine).
+        # '^RDS\d+$'          : SPHFRRDS suivi uniquement de chiffres
+        # '^RDSEXT\d+$'       : RDSEXT suivi uniquement de chiffres
+        # '^RDS'              : tous les noms commencant par SPHFRRDS
+        # '^RDS25$'           : uniquement SPHFRRDS25
+        # '^RDS(1|25|100)$'   : uniquement SPHFRRDS1, SPHFRRDS25 et SPHFRRDS100
+        # '^RDS(EXT)?\d+$'    : SPHFRRDS ou SPHFRRDSEXT, suivis de chiffres
+        # '.*'                     : tous les serveurs de la liste XML
   
-# ============================================================
-# ETAPE 1 - TEST WINRM
-# ============================================================
+# =====================================================================
+# BLOC 2 - SERVEURS DEPUIS SERVER MANAGER
+# =====================================================================
   
-$Online  = @()
-$Offline = @()
+$T0 = Get-Date
   
-$total = $Servers.Count
-$i = 0
-  
-foreach ($srv in $Servers) {
-    $i++
-    Write-Host ("[{0,3}/{1}] Test WinRM {2}" -f $i,$total,$srv) -ForegroundColor Gray
-  
-    if (Test-WSMan $srv -ErrorAction SilentlyContinue) {
-        $Online += $srv
-    }
-    else {
-        $Offline += $srv
-    }
+$XmlPath = "$env:APPDATA\Microsoft\Windows\ServerManager\ServerList.xml"
+if (-not (Test-Path $XmlPath)) {
+    throw "Fichier introuvable : $XmlPath"
 }
+[xml]$Xml = Get-Content $XmlPath
   
-Write-Host "Total : $total | Online : $($Online.Count) | Offline : $($Offline.Count) "
+$NbServeursXML = @($Xml.ServerList.ServerInfo).Count
   
-# ============================================================
-# ETAPE 2 - COLLECTE EVENTS PAR INVOKE-COMMAND
-# ============================================================
-  
-$Events = @()
-$BadInvoke = @()
-  
-$Logs = @(
-    "Microsoft-FSLogix-Apps/Operational",
-    "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
-    "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+$Servers = @(
+    $Xml.ServerList.ServerInfo.Name |
+        Where-Object {
+            ($_ -split '\.')[0] -match $ServeurFiltre
+        } |
+        Sort-Object -Unique
 )
+if ($Servers.Count -eq 0) {
+    throw "Aucun RDS trouve."
+}
+New-Item -ItemType Directory -Path $ExportPath -Force |
+    Out-Null
   
-$total = $Online.Count
-$i = 0
+Write-Host "`n========== AUDIT SESSIONS RDS ==========" -ForegroundColor Cyan
+Write-Host "Serveurs dans la liste XML       : $NbServeursXML"
+Write-Host "Serveurs retenus selon le filtre : $($Servers.Count)"
   
-foreach ($srv in $Online) {
-    $i++
-    Write-Host ("[{0,3}/{1}] Controle sur {2}" -f $i,$total,$srv) -ForegroundColor Gray
-  
+# =====================================================================
+# BLOC 3 - COLLECTE DISTANTE : SESSIONS ET MEMOIRE
+# =====================================================================
+$Collect = {
+    param($OnlyDisconnected)
+    $Server = $env:COMPUTERNAME
+    $Capture = Get-Date
+    # -------------------------------------------------------------
+    # BLOC 3.1 - API WTS WINDOWS
+    # -------------------------------------------------------------
+    if (-not ("RdsWtsNative" -as [type])) {
+        $Source = @'
+using System;
+using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+public struct RdsWtsSessionInfo
+{
+    public int SessionID;
+    [MarshalAs(UnmanagedType.LPWStr)]
+    public string WinStationName;
+    public int State;
+}
+[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+public struct RdsWtsInfo
+{
+    public int State;
+    public int SessionId;
+    public int IncomingBytes;
+    public int OutgoingBytes;
+    public int IncomingFrames;
+    public int OutgoingFrames;
+    public int IncomingCompressedBytes;
+    public int OutgoingCompressedBytes;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)]
+    public string WinStationName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=17)]
+    public string Domain;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=21)]
+    public string UserName;
+    public long ConnectTime;
+    public long DisconnectTime;
+    public long LastInputTime;
+    public long LogonTime;
+    public long CurrentTime;
+}
+public class RdsWtsNative
+{
+    [DllImport("wtsapi32.dll",
+        EntryPoint="WTSEnumerateSessionsW", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool WTSEnumerateSessions(
+        IntPtr server, int reserved, int version,
+        ref IntPtr sessions, ref int count);
+    [DllImport("wtsapi32.dll",
+        EntryPoint="WTSQuerySessionInformationW", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool WTSQuerySessionInformation(
+        IntPtr server, int sessionId, int infoClass,
+        ref IntPtr buffer, ref int bytesReturned);
+    [DllImport("wtsapi32.dll")]
+    public static extern void WTSFreeMemory(IntPtr memory);
+}
+'@
+        Add-Type -TypeDefinition $Source -ErrorAction Stop
+    }
+    function Convert-WtsTime {
+        param([long]$Value)
+        if ($Value -le 0) { return $null }
+        try {
+            return [datetime]::FromFileTimeUtc(
+                $Value
+            ).ToLocalTime()
+        }
+        catch {
+            return $null
+        }
+    }
+    # -------------------------------------------------------------
+    # BLOC 3.2 - ENUMERATION DES SESSIONS
+    # -------------------------------------------------------------
+    $Pointer = [IntPtr]::Zero
+    $Count = 0
+    $Sessions = @()
+    $Success = [RdsWtsNative]::WTSEnumerateSessions(
+        [IntPtr]::Zero, 0, 1,
+        [ref]$Pointer, [ref]$Count
+    )
+    if (-not $Success) {
+        $Code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "WTSEnumerateSessions erreur $Code"
+    }
     try {
-        $Events += Invoke-Command -ComputerName $srv -ErrorAction Stop -ScriptBlock {
-            param($User,$Start,$Logs)
-  
-            foreach ($Log in $Logs) {
-  
-                try {
-                    # Filtre different selon le journal
-                    $Filter = @{
-                        LogName   = $Log
-                        StartTime = $Start
-                    }
-  
-                    if ($Log -eq "Microsoft-FSLogix-Apps/Operational") {
-                        $Filter.Id = @(25)
-                    }
-                    elseif ($Log -eq "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational") {
-                        $Filter.Id = @(21,22,23,24,41,42)
-                    }
-                    elseif ($Log -eq "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational") {
-                        $Filter.Id = @(1149)
-                    }
-  
-                    $RawEvents = Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop
-                }
-                catch {
+        $StructSize = [Runtime.InteropServices.Marshal]::SizeOf(
+            [type][RdsWtsSessionInfo]
+        )
+        for ($I = 0; $I -lt $Count; $I++) {
+            $Address = [IntPtr]::Add(
+                $Pointer, $I * $StructSize
+            )
+            $Entry = [Runtime.InteropServices.Marshal]::PtrToStructure(
+                $Address, [type][RdsWtsSessionInfo]
+            )
+            # Exclure les sessions systeme et listeners.
+            if ($Entry.SessionID -eq 0) { continue }
+            if ($Entry.State -eq 6) { continue }
+            $InfoPointer = [IntPtr]::Zero
+            $Bytes = 0
+            $OK = [RdsWtsNative]::WTSQuerySessionInformation(
+                [IntPtr]::Zero,
+                $Entry.SessionID,
+                24,
+                [ref]$InfoPointer,
+                [ref]$Bytes
+            )
+            if (-not $OK) { continue }
+            try {
+                $RequiredSize = [Runtime.InteropServices.Marshal]::SizeOf(
+                    [type][RdsWtsInfo]
+                )
+                if ($Bytes -lt $RequiredSize) { continue }
+                $Info = [Runtime.InteropServices.Marshal]::PtrToStructure(
+                    $InfoPointer, [type][RdsWtsInfo]
+                )
+                if ($Info.SessionId -ne $Entry.SessionID) {
                     continue
                 }
-  
-                $RawEvents |
-                Where-Object { $_.Message -match [regex]::Escape($User) } |
-                ForEach-Object {
-                    $Msg = ($_.Message -replace "`r|`n"," " -replace "\s+"," ").Trim()
-  
-                    $Action = switch -Regex ($Msg) {
-                        "User authentication succeeded" { "AUTH"; break }
-                        "Session logon succeeded"       { "LOGON"; break }
-                        "Shell start"                   { "SHELL"; break }
-                        "Session logoff succeeded"      { "LOGOFF"; break }
-                        "Session has been disconnected" { "DISCO"; break }
-                        "Profile load.*Status:\s*0"     { "FSLOAD"; break }
-                        "Profile load"                  { "FSLOAD_ERR"; break }
-                        "error|failed|denied|lock"      { "ERROR"; break }
-                        default                         { "INFO" }
-                    }
-  
-                    [PSCustomObject]@{
-                        Time      = $_.TimeCreated
-                        Server    = $env:COMPUTERNAME
-                        Action    = $Action
-                        Id        = $_.Id
-                        SessionId = if ($Msg -match "Session ID:\s*(\d+)") { $matches[1] } else { "" }
-                    }
+                if ([string]::IsNullOrWhiteSpace($Info.UserName)) {
+                    continue
+                }
+                if ($OnlyDisconnected -and $Info.State -ne 4) {
+                    continue
+                }
+                $Etat = switch ($Info.State) {
+                    0 { "Active" }
+                    1 { "Connected" }
+                    4 { "Disconnected" }
+                    5 { "Idle" }
+                    default { "Other" }
+                }
+                $Logon = Convert-WtsTime $Info.LogonTime
+                $Connect = Convert-WtsTime $Info.ConnectTime
+                $Disconnect = Convert-WtsTime $Info.DisconnectTime
+                $LastInput = Convert-WtsTime $Info.LastInputTime
+                $Idle = $null
+                $DisconnectDuration = $null
+                if ($LastInput -and $LastInput -le $Capture) {
+                    $Idle = $Capture - $LastInput
+                }
+                if (
+                    $Info.State -eq 4 -and
+                    $Disconnect -and
+                    $Disconnect -le $Capture
+                ) {
+                    $DisconnectDuration = $Capture - $Disconnect
+                }
+                $User = if ($Info.Domain) {
+                    "$($Info.Domain)\$($Info.UserName)"
+                } else {
+                    $Info.UserName
+                }
+                $Sessions += [pscustomobject]@{
+                    Serveur        = $Server
+                    Utilisateur    = $User
+                    SessionID      = $Info.SessionId
+                    Etat           = $Etat
+                    Logon          = $Logon
+                    Connexion      = $Connect
+                    Deconnexion    = if ($Info.State -eq 4) {
+                        $Disconnect
+                    } else { $null }
+                    IdleMinutes    = if ($Idle) {
+                        [math]::Round($Idle.TotalMinutes, 1)
+                    } else { $null }
+                    DeconnexionH   = if ($DisconnectDuration) {
+                        [math]::Round(
+                            $DisconnectDuration.TotalHours, 2
+                        )
+                    } else { $null }
+                    SessionPlus24H = (
+                        $null -ne $Logon -and
+                        ($Capture - $Logon).TotalHours -ge 24
+                    )
                 }
             }
-        } -ArgumentList $User,$Start,$Logs
-    }
-    catch {
-        $BadInvoke += $srvf
-    }
-}
-  
-$Events = $Events | Sort-Object Time
-  
-# ============================================================
-# ETAPE 3 - ANALYSE DES Candidats
-# ============================================================
-  
-$Suspects = @($Analysis | Where-Object { $_.IsSuspect })
-  
-$Analysis = @($Events | Group-Object Server | ForEach-Object {
-    $g = $_.Group | Sort-Object Time
-    $last = $g | Select-Object -Last 1
-  
-    $hasLogon  = $g.Action -contains "LOGON"
-    $hasShell  = $g.Action -contains "SHELL"
-    $hasFsload = $g.Action -contains "FSLOAD"
-    $hasLogoff = $g.Action -contains "LOGOFF"
-    $hasDisco  = $g.Action -contains "DISCO"
-    $hasError  = ($g.Action -contains "ERROR") -or ($g.Action -contains "FSLOAD_ERR")
-  
-    $IsSuspect = $false
-    $Reason = ""
-  
-    if ($hasError) {
-        $IsSuspect = $true
-        $Reason = "ERREUR/LOCK possible"
-    }
-    elseif ($hasFsload -and -not $hasLogoff) {
-        $IsSuspect = $true
-        $Reason = "profil FSLogix charge sans logoff detecte"
-    }
-    elseif ($hasLogon -and -not $hasLogoff) {
-        $IsSuspect = $true
-        $Reason = "session utilisateur ouverte sans logoff detecte"
-    }
-    elseif ($hasDisco -and -not $hasLogoff) {
-        $IsSuspect = $true
-        $Reason = "session deconnectee sans logoff"
-    }
-  
-    [PSCustomObject]@{
-        Server     = $_.Name
-        Last       = $last.Time
-        LastAction = $last.Action
-        SessionId  = $last.SessionId
-        IsSuspect  = $IsSuspect
-        Reason     = $Reason
-    }
-})
-  
-$Suspects = @($Analysis | Where-Object { $_.IsSuspect })
-# ============================================================
-# ETAPE 4 - CONTROLE VOLUME FSLOGIX
-# ============================================================
-  
-$VolumeCheck = @()
-  
-foreach ($srv in $Suspects.Server) {
-    Write-Host ("Controle volume FSLogix sur {0}" -f $srv) -ForegroundColor Cyan
-  
-    try {
-        $VolumeCheck += Invoke-Command -ComputerName $srv -ErrorAction Stop -ScriptBlock {
-            param($User)
-  
-            Get-Volume -ErrorAction SilentlyContinue |
-            Where-Object { $_.FileSystemLabel -eq "Profile-$User" } |
-            ForEach-Object {
-                [PSCustomObject]@{
-                    Server = $env:COMPUTERNAME
-                    Label  = $_.FileSystemLabel
-                    FreeGB = [math]::Round($_.SizeRemaining / 1GB, 2)
-                    SizeGB = [math]::Round($_.Size / 1GB, 2)
+            finally {
+                if ($InfoPointer -ne [IntPtr]::Zero) {
+                    [RdsWtsNative]::WTSFreeMemory($InfoPointer)
                 }
             }
-        } -ArgumentList $User
+        }
     }
-    catch {
-        $BadInvoke += $srv
+    finally {
+        if ($Pointer -ne [IntPtr]::Zero) {
+            [RdsWtsNative]::WTSFreeMemory($Pointer)
+        }
     }
-}
-  
-# ============================================================
-# BLOC 5 RAPPORT FINAL
-# ============================================================
-  
-$Runtime = (Get-Date) - $T0
-  
-cls
-  
-Write-Host "        HFR - Diagnostic FSLogix / RDS (READ ONLY)" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
-Write-Host ("Utilisateur       : {0}" -f $User)
-Write-Host ("Fenetre analyse   : {0} minutes" -f $Minutes)
-Write-Host ("Serveurs analyses : {0}" -f $Online.Count)
-Write-Host ("Duree du scan     : {0}" -f $Runtime.ToString("hh\:mm\:ss"))
-Write-Host ("Date              : {0}" -f (Get-Date).ToString("dd.MM.yyyy HH:mm:ss"))
-Write-Host ""
-  
-Write-Host "ETAPE 1 - CONNECTIVITE WINRM" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
-Write-Host ("Serveurs testes        : {0}" -f $Servers.Count)
-Write-Host ("Joignables             : {0}" -f $Online.Count)
-Write-Host ("Non joignables         : {0}" -f $Offline.Count)
-Write-Host ""
-  
-if ($Offline.Count) {
-    Write-Host "Serveurs non joignables :" -ForegroundColor Yellow
-    $Offline | ForEach-Object { Write-Host (" - {0}" -f $_) -ForegroundColor Yellow }
-}
-else {
-    Write-Host "Tous les serveurs repondent a WinRM." -ForegroundColor Green
-}
-  
-Write-Host ""
-Write-Host "ETAPE 2 - INVOKE-COMMAND" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
-Write-Host ("Serveurs en erreur : {0}" -f (($BadInvoke | Sort-Object -Unique).Count))
-Write-Host ""
-  
-if ($BadInvoke.Count) {
-    ($BadInvoke | Sort-Object -Unique) | ForEach-Object {
-        Write-Host (" - {0}" -f $_) -ForegroundColor Yellow
+    # -------------------------------------------------------------
+    # BLOC 3.3 - MEMOIRE DES PROCESSUS
+    # -------------------------------------------------------------
+    $Processes = @(
+        Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object { $_.SessionId -gt 0 }
+    )
+    $ProcessesBySession = $Processes |
+        Group-Object SessionId
+    $MemoryIndex = @{}
+    foreach ($Group in $ProcessesBySession) {
+        $WS = 0.0
+        $Private = 0.0
+        foreach ($P in $Group.Group) {
+            $WS += [double]$P.WorkingSetSize
+            $Private += [double]$P.PrivatePageCount
+        }
+        $MemoryIndex[[int]$Group.Name] = [pscustomobject]@{
+            RAM_Go      = [math]::Round($WS / 1GB, 3)
+            Private_Go  = [math]::Round($Private / 1GB, 3)
+            Processus   = $Group.Count
+        }
     }
-}
-else {
-    Write-Host "Aucun serveur n'a refuse l'execution distante." -ForegroundColor Green
-}
+    # -------------------------------------------------------------
+    # BLOC 3.4 - ASSOCIATION SESSIONS / MEMOIRE
+    # -------------------------------------------------------------
+    $Details = foreach ($S in $Sessions) {
+        $M = $MemoryIndex[[int]$S.SessionID]
+        [pscustomobject]@{
+            Serveur        = $S.Serveur
+            Utilisateur    = $S.Utilisateur
+            SessionID      = $S.SessionID
+            Etat           = $S.Etat
+            Logon          = $S.Logon
+            Connexion      = $S.Connexion
+            Deconnexion    = $S.Deconnexion
+            IdleMinutes    = $S.IdleMinutes
+            DeconnexionH   = $S.DeconnexionH
+            Plus24H        = $S.SessionPlus24H
+            RAM_Go         = if ($M) { $M.RAM_Go } else { 0 }
+            Private_Go     = if ($M) { $M.Private_Go } else { 0 }
+            Processus      = if ($M) { $M.Processus } else { 0 }
+            Capture        = $Capture
+        }
+    }
   
-Write-Host ""
-Write-Host "ETAPE 3 - TIMELINE DES EVENEMENTS" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
+    # -------------------------------------------------------------
+    # BLOC 3.5 - RAM, SWAP, ENGAGEMENT ET CONFIGURATION
+    # -------------------------------------------------------------
   
-if ($Events.Count) {
-    foreach ($e in $Events) {
-        $Color = switch ($e.Action) {
-            "LOGOFF"     { "Green" }
-            "FSLOAD"     { "Green" }
-            "LOGON"      { "Green" }
-            "SHELL"      { "DarkGreen" }
-            "DISCO"      { "Yellow" }
-            "ERROR"      { "Red" }
-            "FSLOAD_ERR" { "Red" }
-            default      { "Gray" }
+    $OS = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $Computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+    $DaysSinceLastBoot = [math]::Round(
+        ((Get-Date) - $OS.LastBootUpTime).TotalDays, 2
+    )
+  
+    $Memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory `
+        -ErrorAction Stop
+  
+    $PageFiles = @(
+        Get-CimInstance Win32_PageFileUsage -ErrorAction Stop
+    )
+  
+    $PageSettings = @(
+        Get-CimInstance Win32_PageFileSetting -ErrorAction Stop
+    )
+  
+    # RAM visible par Windows : valeurs source en Ko.
+    $RAMTotale = [math]::Round(
+        [double]$OS.TotalVisibleMemorySize / 1MB, 2
+    )
+  
+    $RAMUtilisee = [math]::Round(
+        ([double]$OS.TotalVisibleMemorySize -
+         [double]$OS.FreePhysicalMemory) / 1MB, 2
+    )
+  
+    # Fichiers d'echange actifs : valeurs source en Mo.
+    $SWAPTotal = [math]::Round(
+        [double](($PageFiles |
+            Measure-Object AllocatedBaseSize -Sum).Sum) / 1024, 2
+    )
+  
+    $SWAPUtilise = [math]::Round(
+        [double](($PageFiles |
+            Measure-Object CurrentUsage -Sum).Sum) / 1024, 2
+    )
+  
+    # Memoire validee : compteurs source en octets.
+    $Engagee = [math]::Round(
+        [double]$Memory.CommittedBytes / 1GB, 2
+    )
+  
+    $LimiteEngagement = [math]::Round(
+        [double]$Memory.CommitLimit / 1GB, 2
+    )
+  
+    $MargeEngagement = [math]::Round(
+        ([double]$Memory.CommitLimit -
+         [double]$Memory.CommittedBytes) / 1GB, 2
+    )
+  
+    # Configuration : detail par fichier si plusieurs sont definis.
+    $SWAPConfig = if ($Computer.AutomaticManagedPagefile) {
+        "Automatique Windows"
+    }
+    elseif ($PageSettings.Count -gt 0) {
+        $Descriptions = foreach ($Setting in $PageSettings) {
+            $Mode = if (
+                $Setting.InitialSize -eq 0 -and
+                $Setting.MaximumSize -eq 0
+            ) {
+                "Systeme"
+            }
+            elseif ($Setting.InitialSize -eq $Setting.MaximumSize) {
+                "Fixe $($Setting.InitialSize) Mo"
+            }
+            else {
+                "Variable $($Setting.InitialSize)-$($Setting.MaximumSize) Mo"
+            }
+  
+            "$($Setting.Name) : $Mode"
         }
   
-        Write-Host ("{0:HH:mm:ss}  {1,-14} {2,-8} SID:{3,-3} ID:{4}" -f $e.Time,$e.Server,$e.Action,$e.SessionId,$e.Id) -ForegroundColor $Color
+        $Descriptions -join " | "
     }
-}
-else {
-    Write-Host "Aucun evenement trouve pour cet utilisateur dans la fenetre analysee." -ForegroundColor Yellow
-}
-  
-Write-Host ""
-Write-Host "ETAPE 4 - ANALYSE" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
-  
-Write-Host ("Nombre de serveurs candidats au controle volume : {0}" -f $Suspects.Count)
-Write-Host ""
-  
-if ($Suspects.Count -gt 0) {
-    foreach ($s in ($Suspects | Sort-Object Last -Descending)) {
-        Write-Host $s.Server -ForegroundColor Yellow
-        Write-Host ("  Derniere action : {0}" -f $s.LastAction)
-        Write-Host ("  Session         : {0}" -f $s.SessionId)
-        Write-Host ("  Analyse         : {0}" -f $s.Reason)
-        Write-Host ""
+    elseif ($PageFiles.Count -eq 0) {
+        "Desactive"
     }
-}
-else {
-    Write-Host "Aucun serveur candidat detecte pour le controle volume." -ForegroundColor Green
-}
-  
-Write-Host "ETAPE 5 - CONTROLE FSLOGIX" -ForegroundColor Cyan
-Write-Host "==============================================================" -ForegroundColor Cyan
-  
-if ($VolumeCheck.Count -gt 0) {
-    foreach ($v in $VolumeCheck) {
-        Write-Host $v.Server -ForegroundColor Magenta
-        Write-Host ("  Volume detecte : {0}" -f $v.Label)
-        Write-Host ("  Taille         : {0} GB" -f $v.SizeGB)sss
-        Write-Host ("  disponible     : {0} GB" -f $v.FreeGB)
-        Write-Host ""
+    else {
+        "Actif - configuration non determinee"
     }
   
-    Write-Host "==============================================================" -ForegroundColor Magenta
-    Write-Host "RESULTAT : " -ForegroundColor Magenta -NoNewline
-    Write-Host ("Volume : {0}" -f $VolumeCheck[0].Label) -ForegroundColor Green -NoNewline
-    Write-Host ("sur : $v.Server" -ForegroundColor Green
-    Write-Host "==============================================================" -ForegroundColor Magenta
+        # -------------------------------------------------------------
+    # BLOC 3.5.1 - MODE DRAIN RDS
+    # -------------------------------------------------------------
   
-   
+    $DrainMode = try {
+        $TS = Get-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -ErrorAction Stop
+  
+        switch ($TS.TSServerDrainMode) {
+            0       { "Non" }
+            1       { "Oui - jusqu'au redemarrage" }
+            2       { "Oui - permanent" }
+            default { "Indetermine" }
+        }
+    }
+    catch {
+        "Erreur lecture"
+    }
+  
+      # -------------------------------------------------------------
+    # BLOC 3.6 - RESULTAT DU SERVEUR
+    # -------------------------------------------------------------
+  
+    [pscustomobject]@{
+        Serveur               = $Server
+        Drain_Mode            = $DrainMode
+        'Day.Since.LastBoot' = $DaysSinceLastBoot
+  
+        RAM_Total_Go          = $RAMTotale
+        RAM_Utilisee_Go       = $RAMUtilisee
+  
+        SWAP_Total_Go         = $SWAPTotal
+        SWAP_Utilise_Go       = $SWAPUtilise
+        SWAP_Config           = $SWAPConfig
+  
+        Validee_Go            = $Engagee
+        Limite_Validation_Go  = $LimiteEngagement
+        Marge_Validation_Go   = $MargeEngagement
+  
+        Capture               = $Capture
+        Sessions              = @($Details)
+        Total                 = @($Details).Count
+        Disc                  = @(
+            $Details | Where-Object Etat -eq "Disconnected"
+        ).Count
+    }
+  
 }
-elseif ($Suspects.Count -gt 0) {
-    Write-Host "Aucun volume Profile-$User trouve sur les serveurs candidats." -ForegroundColor Yellow
+# =====================================================================
+# BLOC 4 - EXECUTION PARALLELE ET SUIVI
+# =====================================================================
+  
+$TimeoutAtteint = $false
+$Job = Invoke-Command `
+    -ComputerName $Servers `
+    -ScriptBlock $Collect `
+    -ArgumentList $OnlyDisconnected `
+    -ThrottleLimit $ThrottleLimit `
+    -AsJob
+$Done = @{}
+$StartCollect = Get-Date
+do {
+    foreach ($Child in $Job.ChildJobs) {
+        $ID = $Child.InstanceId.ToString()
+        if ($Done.ContainsKey($ID)) { continue }
+        if ($Child.State -in @("Completed", "Failed", "Stopped")) {
+            $Done[$ID] = $true
+            $Name = $Child.Location
+            if ($Child.State -eq "Completed") {
+                Write-Host "[OK] Recolte sur $Name effectuee" `
+                    -ForegroundColor Green
+            }
+            else {
+                Write-Host "[KO] Recolte sur $Name echouee" `
+                    -ForegroundColor Red
+            }
+            $Pct = [math]::Min(
+                100, $Done.Count / $Servers.Count * 100
+            )
+            Write-Progress `
+                -Activity "Collecte sessions RDS" `
+                -Status "$($Done.Count)/$($Servers.Count) serveurs" `
+                -PercentComplete $Pct
+        }
+    }
+    if ($Done.Count -ge $Servers.Count) { break }
+    if (
+        ((Get-Date) - $StartCollect).TotalSeconds -ge
+        $TimeoutSeconds
+    ) {
+        Write-Warning "Timeout global atteint."
+        $TimeoutAtteint = $true
+        Stop-Job $Job
+        break
+    }
+    Start-Sleep -Milliseconds 500
+} while ($true)
+Write-Progress -Activity "Collecte sessions RDS" -Completed
+$RawResults = @(Receive-Job $Job -ErrorAction SilentlyContinue)
+  
+$ServeursEnErreur = @(
+    foreach ($Child in $Job.ChildJobs) {
+        $Resultat = @(
+            $RawResults | Where-Object {
+                $_.PSComputerName -eq $Child.Location
+            }
+        )
+  
+        if ($Child.State -ne "Completed" -or $Resultat.Count -eq 0) {
+            $Child.Location
+        }
+    }
+) | Sort-Object -Unique
+  
+Remove-Job $Job -Force
+# =====================================================================
+# BLOC 5 - CONSOLIDATION
+# =====================================================================
+$Report = @(
+    foreach ($R in $RawResults) {
+        foreach ($S in $R.Sessions) {
+            $S
+        }
+    }
+)
+$Report = @(
+    $Report |
+        Sort-Object Private_Go -Descending
+)
+  
+# -----------------------------------------------------------------
+# BLOC 5.1 - SYNTHESE MEMOIRE PAR SERVEUR
+# -----------------------------------------------------------------
+  
+$Summary = @(
+    $RawResults |
+        ForEach-Object {
+            [pscustomobject]@{
+                Serveur              = $_.Serveur
+                Drain_Mode           = $_.Drain_Mode
+                Sessions             = $_.Total
+                Deconnectees         = $_.Disc
+  
+                RAM_Utilisee_Go      = $_.RAM_Utilisee_Go
+                RAM_Total_Go         = $_.RAM_Total_Go
+  
+                SWAP_Utilise_Go      = $_.SWAP_Utilise_Go
+                SWAP_Total_Go        = $_.SWAP_Total_Go
+  
+                Validee_Go           = $_.Validee_Go
+                Limite_Validation_Go = $_.Limite_Validation_Go
+                Marge_Validation_Go  = $_.Marge_Validation_Go
+  
+                'Day.Since.LastBoot' = $_.'Day.Since.LastBoot'
+                SWAP_Config          = $_.SWAP_Config
+            }
+        } |
+        Sort-Object Marge_Validation_Go
+)
+  
+# =====================================================================
+# BLOC 6 - RAPPORTS CONSOLE ET OUT-GRIDVIEW
+# =====================================================================
+# BLOC 6.1 - SYNTHESE PAR RDS
+Write-Host "`n========== SYNTHESE PAR RDS ==========" `
+    -ForegroundColor Cyan
+$Summary |
+    Format-Table -Property * -AutoSize -Wrap |
+    Out-String -Width 4096 |
+    Write-Host
+  
+# BLOC 6.2 - TOP SESSIONS PAR MEMOIRE PRIVEE ENGAGEE
+Write-Host "`n========== TOP $limiteuser SESSIONS PAR MEMOIRE PRIVEE ENGAGEE ==========" `
+    -ForegroundColor Yellow
+$Report |
+    Sort-Object Private_Go -Descending |
+    Select-Object -First $limiteuser |
+    Select-Object Serveur, Utilisateur, SessionID, Etat,
+        Private_Go, RAM_Go, Processus, IdleMinutes, DeconnexionH |
+    Format-Table -AutoSize
+  
+# BLOC 6.3 - TOP DECONNECTEES PAR MEMOIRE PRIVEE ENGAGEE
+Write-Host "`n========== TOP $limiteuser SESSIONS DECONNECTEES PAR MEMOIRE PRIVEE ENGAGEE ==========" `
+    -ForegroundColor Yellow
+$Report |
+    Where-Object Etat -eq "Disconnected" |
+    Sort-Object Private_Go -Descending |
+    Select-Object -First $limiteuser |
+    Select-Object Serveur, Utilisateur, SessionID,
+        DeconnexionH, IdleMinutes, Private_Go,
+        RAM_Go, Processus |
+    Format-Table -AutoSize
+  
+# BLOC 6.4 - TOP PAR INACTIVITE
+Write-Host "`n========== TOP $limiteuser SESSIONS INACTIVES ==========" `
+    -ForegroundColor Yellow
+$Report |
+    Where-Object {
+        $_.Etat -eq "Active" -and
+        $null -ne $_.IdleMinutes -and
+        $_.IdleMinutes -gt 0
+    } |
+    Sort-Object IdleMinutes -Descending |
+    Select-Object -First $limiteuser |
+    Select-Object Serveur, Utilisateur, SessionID, Etat,
+        IdleMinutes, Logon, Private_Go, RAM_Go, Processus |
+    Format-Table -AutoSize
+  
+# BLOC 6.5 - TOP PAR ANCIENNETE DE DECONNEXION
+Write-Host "`n========== TOP $limiteuser PLUS ANCIENNES DECONNEXIONS ==========" `
+    -ForegroundColor Yellow
+$Report |
+    Where-Object {
+        $_.Etat -eq "Disconnected" -and
+        $null -ne $_.DeconnexionH
+    } |
+    Sort-Object DeconnexionH -Descending |
+    Select-Object -First $limiteuser |
+    Select-Object Serveur, Utilisateur, SessionID,
+        Deconnexion, DeconnexionH, IdleMinutes,
+        Private_Go, RAM_Go, Processus |
+    Format-Table -AutoSize
+  
+# BLOC 6.6 - RAPPORT COMPLET
+  
+if ($afficherOUTGRID) {
+    Write-Host "`n========== TOUTES LES CONNEXIONS ==========" `
+    -ForegroundColor Cyan
+  
+    $Report |
+        Select-Object Serveur, Utilisateur, SessionID, Etat,
+            Logon, Connexion, Deconnexion, IdleMinutes,
+            Private_Go, RAM_Go, Processus |
+        Out-GridView -Title "RDS - Sessions, memoire privee engagee et working sets"
+}
+  
+# =====================================================================
+# BLOC 7 - EXPORT CSV ET BILAN
+# =====================================================================
+$Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$Report |
+    Export-Csv "$ExportPath\${Stamp}_Connections.csv" `
+        -NoTypeInformation -Delimiter ";" -Encoding UTF8
+$Summary |
+    Export-Csv "$ExportPath\${Stamp}_Synthese.csv" `
+        -NoTypeInformation -Delimiter ";" -Encoding UTF8
+  
+# =====================================================================
+# BLOC 7.1 - RESUME UTILISATEURS ET SERVEURS
+# =====================================================================
+  
+$NbDeconnectees = @(
+    $Report | Where-Object Etat -eq "Disconnected"
+).Count
+  
+$NbIdle = @(
+    $Report | Where-Object {
+        $_.Etat -eq "Active" -and
+        $_.IdleMinutes -gt 0
+    }
+).Count
+  
+# Categories distinctes : deconnectees + actives avec inactivite.
+$NbDeconnecteesEtIdle = @(
+    $Report | Where-Object {
+        $_.Etat -eq "Disconnected" -and
+        $_.IdleMinutes -gt 0
+    }
+).Count
+  
+$NbServeursFaibleMarge = @(
+    $Summary | Where-Object {
+        $null -ne $_.Marge_Validation_Go -and
+        $_.Marge_Validation_Go -lt 4
+    }
+).Count
+  
+$NbServeursMaintenance = @(
+    $Summary | Where-Object { $_.Drain_Mode -like "Oui*" }
+).Count
+  
+$NbServeursRAM80 = @(
+    $Summary | Where-Object {
+        $_.RAM_Total_Go -gt 0 -and
+        ($_.RAM_Utilisee_Go / $_.RAM_Total_Go) -ge 0.80
+    }
+).Count
+  
+$SessionsTriees = @(
+    $Summary | ForEach-Object { [int]$_.Sessions } | Sort-Object
+)
+  
+$Milieu = [int][math]::Floor($SessionsTriees.Count / 2)
+  
+$SessionsMediane = if ($SessionsTriees.Count % 2 -eq 0) {
+    ($SessionsTriees[$Milieu - 1] + $SessionsTriees[$Milieu]) / 2
 }
 else {
-    Write-Host "Controle ignore : aucun serveur candidat." -ForegroundColor Green
-} 
+    $SessionsTriees[$Milieu]
+}
+  
+$IndexP20 = [int][math]::Ceiling(0.20 * $SessionsTriees.Count) - 1
+$SessionsP20 = $SessionsTriees[$IndexP20]
+  
+$NbServeursP20 = @(
+    $Summary | Where-Object { $_.Sessions -le $SessionsP20 }
+).Count
+  
+$PriveMoyen = ($Report | Measure-Object Private_Go -Average).Average
+  
+$PrivateTriee = @(
+    $Report | ForEach-Object { [double]$_.Private_Go } | Sort-Object
+)
+  
+$Milieu = [int][math]::Floor($PrivateTriee.Count / 2)
+  
+$PrivateMediane = if ($PrivateTriee.Count % 2 -eq 0) {
+    ($PrivateTriee[$Milieu - 1] + $PrivateTriee[$Milieu]) / 2
+}
+else {
+    $PrivateTriee[$Milieu]
+}
+  
+# -----------------------------------------------------------------
+# BLOC 7.1.1 - COMPTAGE DES DEPASSEMENTS DE SEUIL
+# -----------------------------------------------------------------
+  
+$NbAlerteIdle = @(
+    $Report | Where-Object {
+        $_.Etat -eq "Active" -and
+        $null -ne $_.IdleMinutes -and
+        $_.IdleMinutes -gt $SeuilIdleMinutes
+    }
+).Count
+  
+$NbAlerteDeconnexion = @(
+    $Report | Where-Object {
+        $_.Etat -eq "Disconnected" -and
+        $null -ne $_.DeconnexionH -and
+        $_.DeconnexionH -gt $SeuilDeconnexionHeures
+    }
+).Count
+  
+$NbAlerteServeur = @(
+    $Summary | Where-Object {
+        $_.Limite_Validation_Go -gt 0 -and
+        (100 * $_.Validee_Go / $_.Limite_Validation_Go) -ge $SeuilValidationPct
+    }
+).Count
+  
+$PrivateP90 = if ($PrivateTriee.Count -gt 0) {
+    $IndexP90 = [int][math]::Ceiling(0.90 * $PrivateTriee.Count) - 1
+    $PrivateTriee[$IndexP90]
+}
+else {
+    $null
+}
+  
+$NbAuDessusP90 = @(
+    $Report | Where-Object {
+        $null -ne $PrivateP90 -and
+        $_.Private_Go -gt $PrivateP90
+    }
+).Count
+  
+$dateexecute = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+  
+# -----------------------------------------------------------------
+# BLOC 7.1.1 - AFFICHAGE FINAL
+# -----------------------------------------------------------------
+  
+Write-Host "`n======= SYNTHESE USAGE =========" -ForegroundColor Cyan
+Write-Host "============= RDS ================" -ForegroundColor Cyan
+  
+Write-Host "Filtre sur les serveurs : $ServeurFiltre" -ForegroundColor DarkYellow
+  
+Write-Host "`n========== UTILISATEURS ==========" -ForegroundColor Cyan
+Write-Host "Sessions                   : $($Report.Count)"
+Write-Host "Sessions deconnectees      : $NbDeconnectees"
+Write-Host "Sessions IDLE              : $NbIdle"
+Write-Host "Deconnectees + IDLE        : $NbDeconnecteesEtIdle"
+Write-Host ("Memoire privee moyenne par session : {0:N2} Go" -f $PriveMoyen)
+Write-Host ("Memoire privee mediane par session : {0:N2} Go" -f $PrivateMediane)
+  
+Write-Host "`n========== SERVEURS ==========" -ForegroundColor Cyan
+Write-Host "Nombre de Serveurs declares : $($Servers.Count)"
+Write-Host "Serveurs analyses           : $($Summary.Count)"
+Write-Host "Serveurs en maintenance     : $NbServeursMaintenance"
+Write-Host "Sessions par serveur - mediane   : $SessionsMediane"
+Write-Host "Serveurs avec sessions <= P20 ($SessionsP20 sessions) : $NbServeursP20"
+  
+Write-Host "`n========== ALERTES ==========" -ForegroundColor Yellow
+if ($TimeoutAtteint) {    Write-Host "Timeout global atteint ($TimeoutSeconds sec)" -ForegroundColor Yellow}
+if ($ServeursEnErreur.Count -gt 0) {    Write-Host "Serveurs en echec ou sans resultat : $($ServeursEnErreur -join ', ')" -ForegroundColor DarkYellow }
+Write-Host "Sessions actives IDLE > $SeuilIdleMinutes min   : $NbAlerteIdle"
+Write-Host "Sessions deconnectees > $SeuilDeconnexionHeures h       : $NbAlerteDeconnexion"
+Write-Host "Serveurs memoire validee >= $SeuilValidationPct%   : $NbAlerteServeur"
+Write-Host (    "Sessions memoire privee > P90 ({0:N2} Go) : {1}" -f    $PrivateP90, $NbAuDessusP90 )
+Write-Host "Serveurs RAM utilisee >= 80%      : $NbServeursRAM80"
+  
+Write-Host "`n========== TERMINE ==========" -ForegroundColor Green
+Write-Host "date d'exécution : $dateexecute"
+Write-Host "Duree  : $([math]::Round(((Get-Date) - $T0).TotalSeconds, 1)) sec"
+Write-Host "Export : $ExportPath"
+  
+ 
 
