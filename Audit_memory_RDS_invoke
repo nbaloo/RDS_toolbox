@@ -1,0 +1,107 @@
+ # ********************
+# Invoke commande avec controle de computer ON
+# ********************
+  
+cls
+$Computers = @( "rdsxxx") 
+  
+#Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object Manufacturer, Model
+foreach ($Computer in $Computers) {
+if (-not (Test-Connection -ComputerName $Computer -Quiet -Count 1)) { write-host "Destination $Computer non joignable" -ForegroundColor Cyan; continue } # test ping et test WinRM ok
+Write-host  "#$Computer start invoke =================================================================================================" -ForegroundColor Cyan #-NoNewline
+#START OF INVOKE ***********************************************************************************************************************************************
+try {Invoke-Command -ComputerName $Computer -ErrorAction Stop -ScriptBlock  {
+# **************************************************************************************************************************************************************
+  
+  
+  
+  
+  
+# =====================================================================
+# BLOC 1 - PARAMETRES
+# =====================================================================
+  
+$NbReleves = 3
+$IntervalleSecondes = 2
+  
+# =====================================================================
+# BLOC 2 - ENGAGEMENT GLOBAL MOINS PRIVE DES SESSIONS UTILISATEURS
+# =====================================================================
+  
+$Controle = @(
+    for ($I = 1; $I -le $NbReleves; $I++) {
+  
+        $Processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+  
+        $Memory = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory `
+            -ErrorAction Stop
+  
+        $PriveUsers = [double]((
+            $Processes |
+                Where-Object SessionId -gt 0 |
+                Measure-Object PrivatePageCount -Sum
+        ).Sum)
+  
+        $PriveServices = [double]((
+            $Processes |
+                Where-Object SessionId -eq 0 |
+                Measure-Object PrivatePageCount -Sum
+        ).Sum)
+  
+        $Engagement = [double]$Memory.CommittedBytes
+  
+        [pscustomobject]@{
+            Serveur                  = $env:COMPUTERNAME
+            Heure                    = Get-Date -Format 'HH:mm:ss'
+            Engagement_Total_Go      = [math]::Round($Engagement / 1GB, 2)
+            Prive_Users_Go           = [math]::Round($PriveUsers / 1GB, 2)
+            Prive_Services_Go        = [math]::Round($PriveServices / 1GB, 2)
+            Systeme_Partage_Autres_Go = [math]::Round(
+                ($Engagement - $PriveUsers - $PriveServices) / 1GB, 2
+            )
+            Hors_Prive_Users_Go      = [math]::Round(
+                ($Engagement - $PriveUsers) / 1GB, 2
+            )
+        }
+  
+        if ($I -lt $NbReleves) {
+            Start-Sleep -Seconds $IntervalleSecondes
+        }
+    }
+)
+  
+# =====================================================================
+# BLOC 3 - RESULTATS
+# =====================================================================
+  
+$Controle |
+    Format-Table -Property * -AutoSize |
+    Out-String -Width 4096 |
+    Write-Host
+  
+$Moyenne = ($Controle | Measure-Object Hors_Prive_Users_Go -Average).Average
+  
+Write-Host ("Engagement moyen hors prive utilisateurs : {0:N2} Go" -f $Moyenne) `
+    -ForegroundColor Yellow
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+}} #END OF INVOKE ***********************************************************************************************************************************************
+# **************************************************************************************************************************************************************
+catch {write-host "invoke HS $Computer : $($_.Exception.Message)" -ForegroundColor Red; continue }
+Write-host  ""
+} #end of foreachk 
+
