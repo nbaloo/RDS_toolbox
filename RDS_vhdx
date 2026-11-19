@@ -1,7 +1,7 @@
  <#
 ==============================================================================
 HFR - Diagnostic FSLogix / RDS (READ ONLY)
-V6 - Nicolas GRUBER - 18.11.2026 - HFR - avec l'aide de ChatGPT
+V6 - Nicolas GRUBER - 18.11.2026 - avec l'aide de ChatGPT
   
 Objectif :
 Identifier le serveur RDS hébergeant actuellement le conteneur FSLogix
@@ -26,7 +26,7 @@ Aucune modification, aucune fermeture de session, aucun démontage de VHD.
 [CmdletBinding()]
 param(
     [ValidateNotNullOrEmpty()]
-    [string]$User = "KaraAhmadN",
+    [string]$User = "monuser",
   
     [ValidateRange(1, 525600)]
     [int]$Minutes = 600,
